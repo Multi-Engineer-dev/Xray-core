@@ -101,3 +101,22 @@ func TestClientEndpointResolvedByXrayDNS(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// Without a domain strategy, a relay name with A and AAAA records must not
+// resolve to the IPv6 address at random: hosts without IPv6 would then never
+// reach the relay.
+func TestResolveLocalPrefersIPv4(t *testing.T) {
+	h := &Handler{
+		dns:            &testDNS{ips: []net.IP{net.ParseIP("2001:db8::1"), net.ParseIP("192.0.2.1")}},
+		streamSettings: &internet.MemoryStreamConfig{},
+	}
+	for i := 0; i < 50; i++ {
+		ip, err := h.resolveLocal("relay.test")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ip.To4() == nil {
+			t.Fatalf("got %v, want the IPv4 address", ip)
+		}
+	}
+}

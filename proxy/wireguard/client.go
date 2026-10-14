@@ -359,37 +359,39 @@ func (h *Handler) resolveLocal(host string) (net.IP, error) {
 	if err != nil {
 		return nil, err
 	}
-	got := ips
+	var got4, got6 []net.IP
+	for _, ip := range ips {
+		if ip.To4() != nil {
+			got4 = append(got4, ip)
+		} else {
+			got6 = append(got6, ip)
+		}
+	}
+	strategy := internet.DomainStrategy_AS_IS
 	if h.streamSettings.SocketSettings != nil {
-		var got4, got6 []net.IP
-		for _, ip := range ips {
-			if ip.To4() != nil {
-				got4 = append(got4, ip)
-			} else {
-				got6 = append(got6, ip)
-			}
-		}
-		switch h.streamSettings.SocketSettings.DomainStrategy {
-		case internet.DomainStrategy_AS_IS, internet.DomainStrategy_USE_IP, internet.DomainStrategy_FORCE_IP:
-			got = ips
-		case internet.DomainStrategy_USE_IP4, internet.DomainStrategy_FORCE_IP4:
-			got = got4
-		case internet.DomainStrategy_USE_IP6, internet.DomainStrategy_FORCE_IP6:
-			got = got6
-		case internet.DomainStrategy_USE_IP46, internet.DomainStrategy_FORCE_IP46:
-			got = got4
-			if len(got) == 0 {
-				got = got6
-			}
-		case internet.DomainStrategy_USE_IP64, internet.DomainStrategy_FORCE_IP64:
-			got = got6
-			if len(got) == 0 {
-				got = got4
-			}
-		}
+		strategy = h.streamSettings.SocketSettings.DomainStrategy
+	}
+	got := ips
+	switch strategy {
+	case internet.DomainStrategy_USE_IP4, internet.DomainStrategy_FORCE_IP4:
+		got = got4
+	case internet.DomainStrategy_USE_IP6, internet.DomainStrategy_FORCE_IP6:
+		got = got6
+	case internet.DomainStrategy_AS_IS, internet.DomainStrategy_USE_IP46, internet.DomainStrategy_FORCE_IP46:
+		// Not a random family for AsIs: the endpoint is resolved once, and an
+		// IPv6 pick on a host without IPv6 leaves the tunnel down.
+		got = got4
 		if len(got) == 0 {
-			return nil, dns.ErrEmptyResponse
+			got = got6
 		}
+	case internet.DomainStrategy_USE_IP64, internet.DomainStrategy_FORCE_IP64:
+		got = got6
+		if len(got) == 0 {
+			got = got4
+		}
+	}
+	if len(got) == 0 {
+		return nil, dns.ErrEmptyResponse
 	}
 	return got[dice.Roll(len(got))], nil
 }
