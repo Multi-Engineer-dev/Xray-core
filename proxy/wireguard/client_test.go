@@ -93,3 +93,11 @@ func TestClientInitRetryKeepsOneDevice(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// The bind socket must come up for an endpoint that only Xray's DNS knows.
+func TestClientEndpointResolvedByXrayDNS(t *testing.T) {
+	h := newTestClient(t, "wg.test:51820", &testDNS{ips: []net.IP{net.ParseIP("127.0.0.1")}})
+	if err := h.init(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}

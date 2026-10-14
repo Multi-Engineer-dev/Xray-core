@@ -258,6 +258,14 @@ func (h *Handler) init(ctx context.Context) error {
 		if err != nil {
 			return nil, err
 		}
+		// Resolve like the peer endpoints, with Xray's DNS, not the system's.
+		if dest.Address.Family().IsDomain() {
+			ip, err := h.resolveLocal(dest.Address.Domain())
+			if err != nil {
+				return nil, err
+			}
+			dest.Address = net.IPAddress(ip)
+		}
 		var pktConn net.PacketConn
 		if h.streamSettings.FinalMask != nil {
 			conn, err := h.streamSettings.FinalMask.DialUDP(ctx, dest)
