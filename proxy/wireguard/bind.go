@@ -17,8 +17,16 @@ import (
 	"golang.zx2c4.com/wireguard/conn"
 )
 
-// socketBufferSize matches wireguard-go's StdNetBind.
-const socketBufferSize = 7 << 20
+const (
+	// socketBufferSize matches wireguard-go's StdNetBind.
+	socketBufferSize = 7 << 20
+
+	// maxGSOSegments is the kernel's limit of datagrams in one UDP_SEGMENT send.
+	maxGSOSegments = 64
+	// A UDP_SEGMENT send must fit in one IP packet before it is split.
+	maxGSOPayload4 = 1<<16 - 1 - 20 - 8
+	maxGSOPayload6 = 1<<16 - 1 - 8
+)
 
 // batchConn reads and writes many datagrams per syscall (recvmmsg/sendmmsg).
 // ipv4.PacketConn and ipv6.PacketConn both implement it.
@@ -37,6 +45,7 @@ type bind struct {
 	// batch is set when the conn is a plain UDP socket on Linux. The traffic
 	// counters are then applied here, since PacketCounterConnection is bypassed.
 	batch        batchConn
+	gso          bool // batch takes UDP_SEGMENT
 	readCounter  stats.Counter
 	writeCounter stats.Counter
 	msgsPool     sync.Pool
@@ -57,7 +66,7 @@ func (b *bind) Open(port uint16) (fns []conn.ReceiveFunc, actualPort uint16, err
 		return nil, 0, err
 	}
 	b.PacketConn = c
-	b.batch, b.readCounter, b.writeCounter = newBatchConn(c)
+	b.batch, b.gso, b.readCounter, b.writeCounter = newBatchConn(c)
 	ch := make(chan struct{})
 	b.closeCh = ch
 
@@ -179,7 +188,7 @@ func (b *bind) SetMark(mark uint32) error {
 
 func (b *bind) Send(bufs [][]byte, ep conn.Endpoint) error {
 	b.mu.Lock()
-	c, bc, wc := b.PacketConn, b.batch, b.writeCounter
+	c, bc, gso, wc := b.PacketConn, b.batch, b.gso, b.writeCounter
 	b.mu.Unlock()
 
 	if c == nil {
@@ -209,7 +218,20 @@ func (b *bind) Send(bufs [][]byte, ep conn.Endpoint) error {
 
 	msgs := b.getMsgs()
 	defer b.putMsgs(msgs)
-	sent, err := sendBatch(bc, *msgs, bufs, addr)
+	sent, err := sendBatch(bc, *msgs, bufs, addr, gso)
+	if err != nil && gso && gsoFailed(err) {
+		// The route does not take UDP_SEGMENT, e.g. no checksum offload or a
+		// path MTU below the datagram size. Send the rest one by one from now on.
+		errors.LogInfoInner(context.Background(), err, "bind: UDP GSO disabled")
+		b.mu.Lock()
+		if b.batch == bc {
+			b.gso = false
+		}
+		b.mu.Unlock()
+		var more int
+		more, err = sendBatch(bc, *msgs, bufs[sent:], addr, false)
+		sent += more
+	}
 	if wc != nil {
 		var total int64
 		for _, buf := range bufs[:sent] {
@@ -225,24 +247,54 @@ func (b *bind) Send(bufs [][]byte, ep conn.Endpoint) error {
 
 // sendBatch sends bufs to addr and returns how many of them went out before
 // an error.
-func sendBatch(bc batchConn, msgs []ipv6.Message, bufs [][]byte, addr *net.UDPAddr) (int, error) {
+func sendBatch(bc batchConn, msgs []ipv6.Message, bufs [][]byte, addr *net.UDPAddr, gso bool) (int, error) {
 	sent := 0
 	for sent < len(bufs) {
-		n := min(len(bufs)-sent, len(msgs))
-		for i := 0; i < n; i++ {
-			msgs[i].Buffers = bufs[sent+i : sent+i+1]
-			msgs[i].Addr = addr
-		}
+		n, count := packMsgs(msgs, bufs[sent:], addr, gso)
 		for i := 0; i < n; {
 			k, err := bc.WriteBatch(msgs[i:n], 0)
 			if err != nil {
-				return sent + i, err
+				for _, m := range msgs[:i] {
+					sent += len(m.Buffers)
+				}
+				return sent, err
 			}
 			i += k
 		}
-		sent += n
+		sent += count
 	}
 	return sent, nil
+}
+
+// packMsgs fills msgs from the start of bufs and returns the number of
+// messages used and of datagrams in them. Each message holds one datagram, or
+// with gso a run of datagrams of one size (only the last may be shorter) that
+// the kernel splits again (UDP_SEGMENT).
+func packMsgs(msgs []ipv6.Message, bufs [][]byte, addr *net.UDPAddr, gso bool) (n, i int) {
+	maxPayload := maxGSOPayload6
+	if addr.IP.To4() != nil {
+		maxPayload = maxGSOPayload4
+	}
+	for ; i < len(bufs) && n < len(msgs); n++ {
+		size := len(bufs[i])
+		j, total := i+1, size
+		for gso && j < len(bufs) && j-i < maxGSOSegments && len(bufs[j]) <= size && total+len(bufs[j]) <= maxPayload {
+			total += len(bufs[j])
+			j++
+			if len(bufs[j-1]) < size {
+				break
+			}
+		}
+		m := &msgs[n]
+		m.Buffers = bufs[i:j]
+		m.Addr = addr
+		m.OOB = m.OOB[:0]
+		if j-i > 1 {
+			m.OOB = setGSOSize(m.OOB, size)
+		}
+		i = j
+	}
+	return n, i
 }
 
 func (b *bind) getMsgs() *[]ipv6.Message {
@@ -250,6 +302,9 @@ func (b *bind) getMsgs() *[]ipv6.Message {
 		return m
 	}
 	msgs := make([]ipv6.Message, conn.IdealBatchSize)
+	for i := range msgs {
+		msgs[i].OOB = make([]byte, 0, gsoControlSize)
+	}
 	return &msgs
 }
 

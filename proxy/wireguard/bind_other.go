@@ -12,6 +12,16 @@ import (
 // syscall anyway, so the bind keeps its plain path.
 const batchSize = 1
 
-func newBatchConn(net.PacketConn) (batchConn, stats.Counter, stats.Counter) {
-	return nil, nil, nil
+const gsoControlSize = 0
+
+func newBatchConn(net.PacketConn) (batchConn, bool, stats.Counter, stats.Counter) {
+	return nil, false, nil, nil
+}
+
+func setGSOSize(oob []byte, _ int) []byte {
+	return oob
+}
+
+func gsoFailed(error) bool {
+	return false
 }

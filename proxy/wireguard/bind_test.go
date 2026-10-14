@@ -4,10 +4,13 @@ import (
 	"bytes"
 	"net"
 	"net/netip"
+	"os"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
+	"golang.org/x/net/ipv6"
 	"golang.zx2c4.com/wireguard/conn"
 )
 
@@ -163,4 +166,174 @@ func TestBindIPv6(t *testing.T) {
 		c.Close()
 	}
 	testBindRoundTrip(t, "udp6", "[::1]:0", "[::1]:0", batchSize > 1)
+}
+
+func TestPackMsgsGSO(t *testing.T) {
+	if gsoControlSize == 0 {
+		t.Skip("no UDP GSO on this system")
+	}
+	sizes := func(n, size int) []int {
+		s := make([]int, n)
+		for i := range s {
+			s[i] = size
+		}
+		return s
+	}
+	cases := []struct {
+		name  string
+		sizes []int
+		want  [][]int // datagram sizes per message
+	}{
+		{
+			"short tail ends a run",
+			[]int{1000, 1000, 1000, 500, 1000, 1200, 1200, 100},
+			[][]int{{1000, 1000, 1000, 500}, {1000}, {1200, 1200, 100}},
+		},
+		{"segment limit", sizes(100, 100), [][]int{sizes(64, 100), sizes(36, 100)}},
+		{"payload limit", sizes(50, 1452), [][]int{sizes(45, 1452), sizes(5, 1452)}},
+	}
+	addr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1}
+	for _, c := range cases {
+		bufs := make([][]byte, len(c.sizes))
+		for i, n := range c.sizes {
+			bufs[i] = make([]byte, n)
+		}
+		msgs := make([]ipv6.Message, conn.IdealBatchSize)
+		n, count := packMsgs(msgs, bufs, addr, true)
+		if count != len(bufs) || n != len(c.want) {
+			t.Fatalf("%s: got %d messages with %d datagrams, want %d with %d", c.name, n, count, len(c.want), len(bufs))
+		}
+		for i, want := range c.want {
+			m := msgs[i]
+			if len(m.Buffers) != len(want) {
+				t.Fatalf("%s: message %d has %d datagrams, want %d", c.name, i, len(m.Buffers), len(want))
+			}
+			for j := range want {
+				if len(m.Buffers[j]) != want[j] {
+					t.Fatalf("%s: message %d datagram %d has %d bytes, want %d", c.name, i, j, len(m.Buffers[j]), want[j])
+				}
+			}
+			if (len(m.OOB) > 0) != (len(want) > 1) {
+				t.Fatalf("%s: message %d: control %v for %d datagrams", c.name, i, m.OOB, len(want))
+			}
+		}
+	}
+}
+
+// gsoConn counts UDP_SEGMENT sends, or rejects them with failErr like a
+// route without checksum offload (EIO) or with a smaller MTU (EMSGSIZE).
+type gsoConn struct {
+	batchConn
+	failErr   error
+	gsoMsgs   int
+	failedGSO int
+}
+
+func (c *gsoConn) WriteBatch(ms []ipv6.Message, flags int) (int, error) {
+	if c.failErr != nil {
+		for i := range ms {
+			if len(ms[i].OOB) > 0 {
+				if i == 0 {
+					c.failedGSO++
+					return 0, os.NewSyscallError("sendmmsg", c.failErr)
+				}
+				ms = ms[:i]
+				break
+			}
+		}
+	}
+	n, err := c.batchConn.WriteBatch(ms, flags)
+	for i := 0; i < n; i++ {
+		if len(ms[i].OOB) > 0 {
+			c.gsoMsgs++
+		}
+	}
+	return n, err
+}
+
+// testBindGSO sends runs of equal-sized datagrams and checks that the peer
+// gets each one intact and in order.
+func testBindGSO(t *testing.T, network, bindAddr, peerAddr string, failErr error) {
+	b, _, _, wc := openTestBind(t, network, bindAddr, nil)
+	if !b.gso {
+		t.Skip("no UDP GSO")
+	}
+	gc := &gsoConn{batchConn: b.batch, failErr: failErr}
+	b.batch = gc
+	pa, err := net.ResolveUDPAddr("udp", peerAddr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	peer, err := net.ListenUDP("udp", pa)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer peer.Close()
+	_ = peer.SetReadBuffer(1 << 20)
+	ep := &conn.StdNetEndpoint{AddrPort: peer.LocalAddr().(*net.UDPAddr).AddrPort()}
+
+	var bufs [][]byte
+	var total int64
+	for i := 0; i < conn.IdealBatchSize; i++ {
+		size := 1200
+		if i%40 == 39 {
+			size = 300 + i
+		}
+		p := testPacket(i % 50)
+		p = append(p, make([]byte, size-len(p))...)
+		bufs = append(bufs, p)
+		total += int64(size)
+	}
+	want := make([][]byte, len(bufs))
+	for i := range bufs {
+		want[i] = bytes.Clone(bufs[i])
+	}
+	if err := b.Send(bufs, ep); err != nil {
+		t.Fatal(err)
+	}
+	_ = peer.SetReadDeadline(time.Now().Add(5 * time.Second))
+	buf := make([]byte, 2048)
+	for i := range want {
+		n, _, err := peer.ReadFrom(buf)
+		if err != nil {
+			t.Fatalf("datagram %d: %v", i, err)
+		}
+		if !bytes.Equal(buf[:n], want[i]) {
+			t.Fatalf("datagram %d differs: got %d bytes, want %d", i, n, len(want[i]))
+		}
+	}
+	if wc.Value() != total {
+		t.Fatalf("write counter = %d, want %d", wc.Value(), total)
+	}
+	if failErr != nil && (gc.failedGSO != 1 || gc.gsoMsgs != 0 || b.gso) {
+		t.Fatalf("failed GSO sends = %d, GSO sends = %d, gso = %v; want 1, 0, false", gc.failedGSO, gc.gsoMsgs, b.gso)
+	}
+	if failErr == nil && gc.gsoMsgs == 0 {
+		t.Fatal("no GSO sends")
+	}
+}
+
+func TestBindGSO(t *testing.T) {
+	testBindGSO(t, "udp4", "127.0.0.1:0", "127.0.0.1:0", nil)
+}
+
+func TestBindGSODualStackToIPv4(t *testing.T) {
+	testBindGSO(t, "udp", "[::]:0", "127.0.0.1:0", nil)
+}
+
+func TestBindGSOIPv6(t *testing.T) {
+	if c, err := net.ListenPacket("udp6", "[::1]:0"); err != nil {
+		t.Skip("no IPv6 loopback")
+	} else {
+		c.Close()
+	}
+	testBindGSO(t, "udp6", "[::1]:0", "[::1]:0", nil)
+}
+
+func TestBindGSOFallback(t *testing.T) {
+	for _, err := range []error{syscall.EIO, syscall.EMSGSIZE, syscall.EINVAL} {
+		t.Run(err.Error(), func(t *testing.T) {
+			testBindGSO(t, "udp4", "127.0.0.1:0", "127.0.0.1:0", err)
+		})
+	}
 }
