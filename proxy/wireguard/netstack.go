@@ -18,6 +18,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -39,16 +40,21 @@ import (
 )
 
 type netTun struct {
-	ep             *channel.Endpoint
-	stack          *stack.Stack
-	events         chan tun.Event
-	notifyHandle   *channel.NotificationHandle
-	incomingPacket chan *buffer.View
-	closed         chan struct{}
-	mtu            int
-	dnsServers     []netip.Addr
-	hasV4, hasV6   bool
+	ep           *channel.Endpoint
+	stack        *stack.Stack
+	events       chan tun.Event
+	notifyHandle *channel.NotificationHandle
+	mu           sync.Mutex
+	drained      *sync.Cond // Read took packets, or the tun closed
+	closed       bool
+	mtu          int
+	dnsServers   []netip.Addr
+	hasV4, hasV6 bool
 }
+
+// maxQueued is how many outbound packets may wait for wireguard-go before the
+// stack's senders wait too, so they do not overflow the endpoint's queue.
+const maxQueued = 256
 
 func CreateNetTUN(localAddresses, dnsServers []netip.Addr, mtu int, handleLocal bool) (tun.Device, *Net, *stack.Stack, error) {
 	opts := stack.Options{
@@ -57,14 +63,13 @@ func CreateNetTUN(localAddresses, dnsServers []netip.Addr, mtu int, handleLocal 
 		HandleLocal:        handleLocal,
 	}
 	dev := &netTun{
-		ep:             channel.New(1024, uint32(mtu), ""),
-		stack:          stack.New(opts),
-		events:         make(chan tun.Event, 10),
-		incomingPacket: make(chan *buffer.View),
-		closed:         make(chan struct{}),
-		dnsServers:     dnsServers,
-		mtu:            mtu,
+		ep:         channel.New(1024, uint32(mtu), ""),
+		stack:      stack.New(opts),
+		events:     make(chan tun.Event, 10),
+		dnsServers: dnsServers,
+		mtu:        mtu,
 	}
+	dev.drained = sync.NewCond(&dev.mu)
 	sackEnabledOpt := tcpip.TCPSACKEnabled(true) // TCP SACK is disabled by default
 	tcpipErr := dev.stack.SetTransportProtocolOption(tcp.ProtocolNumber, &sackEnabledOpt)
 	if tcpipErr != nil {
@@ -127,21 +132,29 @@ func (tun *netTun) Events() <-chan tun.Event {
 	return tun.events
 }
 
+// Read copies the packets the stack has queued into buf, waiting for the
+// first one, so that wireguard-go can encrypt and send them as a batch.
 func (tun *netTun) Read(buf [][]byte, sizes []int, offset int) (int, error) {
-	var view *buffer.View
-	select {
-	case view = <-tun.incomingPacket:
-	case <-tun.closed:
+	n := 0
+	for pkt := tun.ep.ReadContext(context.Background()); pkt != nil; pkt = tun.ep.Read() {
+		size := 0
+		for _, s := range pkt.AsSlices() {
+			size += copy(buf[n][offset+size:], s)
+		}
+		pkt.DecRef()
+		sizes[n] = size
+		n++
+		if n == len(buf) {
+			break
+		}
+	}
+	if n == 0 {
 		return 0, os.ErrClosed
 	}
-
-	n, err := view.Read(buf[0][offset:])
-	view.Release()
-	if err != nil {
-		return 0, err
-	}
-	sizes[0] = n
-	return 1, nil
+	tun.mu.Lock()
+	tun.drained.Broadcast()
+	tun.mu.Unlock()
+	return n, nil
 }
 
 func (tun *netTun) Write(buf [][]byte, offset int) (int, error) {
@@ -164,23 +177,25 @@ func (tun *netTun) Write(buf [][]byte, offset int) (int, error) {
 	return len(buf), nil
 }
 
+// WriteNotify runs in the goroutine that queued a packet and holds it while
+// the queue is long.
 func (tun *netTun) WriteNotify() {
-	pkt := tun.ep.Read()
-	if pkt == nil {
+	if tun.ep.NumQueued() < maxQueued {
 		return
 	}
-
-	view := pkt.ToView()
-	pkt.DecRef()
-
-	select {
-	case tun.incomingPacket <- view:
-	case <-tun.closed:
-		view.Release()
+	tun.mu.Lock()
+	for tun.ep.NumQueued() >= maxQueued && !tun.closed {
+		tun.drained.Wait()
 	}
+	tun.mu.Unlock()
 }
 
 func (tun *netTun) Close() error {
+	tun.mu.Lock()
+	tun.closed = true
+	tun.drained.Broadcast()
+	tun.mu.Unlock()
+
 	tun.stack.RemoveNIC(1)
 	tun.stack.Close()
 	tun.ep.RemoveNotify(tun.notifyHandle)
@@ -188,11 +203,6 @@ func (tun *netTun) Close() error {
 
 	if tun.events != nil {
 		close(tun.events)
-	}
-
-	// we don't close incomingPacket, because WriteNotify may be mid-send on it (DNS lookup) and would panic.
-	if tun.closed != nil {
-		close(tun.closed)
 	}
 
 	return nil
