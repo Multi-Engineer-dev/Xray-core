@@ -1,0 +1,52 @@
+name: Build
+
+on:
+  push:
+    branches: [dev]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: dev-build
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          check-latest: true
+
+      - name: Pick the version
+        id: version
+        run: |
+          VER=$(awk '/Version_[xyz] byte =/ {print $NF}' core/core.go | paste -sd.)
+          LAST=$(git ls-remote --tags origin "refs/tags/v${VER}-dev.*" | grep -v '\^{}' | sed 's|.*-dev\.||' | sort -n | tail -n 1)
+          echo "tag=v${VER}-dev.$((LAST + 1))" >> "$GITHUB_OUTPUT"
+
+      - name: Build Xray
+        env:
+          CGO_ENABLED: 0
+          GOOS: linux
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          mkdir dist
+          BUILD="${TAG#*-}-$(git rev-parse --short HEAD)"
+          for arch in amd64 arm64; do
+            GOARCH=$arch go build -o dist/xray-linux-$arch -trimpath -buildvcs=false -gcflags="all=-l=4" -ldflags="-X github.com/xtls/xray-core/core.build=${BUILD} -s -w -buildid=" -v ./main
+          done
+          cd dist && sha256sum xray-* > sha256sums.txt
+
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          gh release create "$TAG" dist/* --target "$GITHUB_SHA" --latest --title "$TAG" \
+            --notes "main with wireguard-all, remove-user-close and remove-outbound-close merged, at ${GITHUB_SHA}."
