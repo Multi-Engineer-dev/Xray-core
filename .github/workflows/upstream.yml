@@ -1,0 +1,64 @@
+name: Upstream check
+
+on:
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Merge upstream main
+        id: merge
+        run: |
+          git config user.name github-actions
+          git config user.email github-actions@users.noreply.github.com
+          git fetch -q https://github.com/XTLS/Xray-core.git main
+          if git merge-base --is-ancestor FETCH_HEAD HEAD; then
+            echo "dev already has upstream main $(git rev-parse --short FETCH_HEAD)." | tee -a "$GITHUB_STEP_SUMMARY"
+            echo "uptodate=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          {
+            echo "Upstream commits not in dev:"
+            echo '```'
+            git log --oneline HEAD..FETCH_HEAD
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          if ! git merge -q --no-edit FETCH_HEAD; then
+            {
+              echo "Merging them into dev conflicts in:"
+              echo '```'
+              git diff --name-only --diff-filter=U
+              echo '```'
+            } | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+      - uses: actions/setup-go@v7
+        if: steps.merge.outputs.uptodate != 'true'
+        with:
+          go-version-file: go.mod
+          check-latest: true
+
+      - name: Restore Geodat Cache
+        if: steps.merge.outputs.uptodate != 'true'
+        uses: actions/cache/restore@v6
+        with:
+          path: resources
+          key: xray-geodat-
+
+      - name: Build and test the merge
+        if: steps.merge.outputs.uptodate != 'true'
+        run: |
+          go run ./infra/vformat/main.go -mode check
+          go build ./...
+          go test -timeout 1h ./...
