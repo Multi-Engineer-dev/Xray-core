@@ -36,6 +36,7 @@ type Handler struct {
 	tnet *Net
 	dev  *device.Device
 	bind *bind
+	ipc  string
 	mu   sync.Mutex
 }
 
@@ -188,10 +189,6 @@ func NewClient(ctx context.Context, conf *DeviceConfig) (*Handler, error) {
 			cfg.WriteString("persistent_keepalive_interval=" + peer.KeepAlive + "\n")
 		}
 	}
-	if err := dev.IpcSet(cfg.String()); err != nil {
-		dev.Close()
-		return nil, err
-	}
 
 	return &Handler{
 		policyManager: p,
@@ -199,6 +196,7 @@ func NewClient(ctx context.Context, conf *DeviceConfig) (*Handler, error) {
 		tnet: tnet,
 		dev:  dev,
 		bind: bind,
+		ipc:  cfg.String(),
 	}, nil
 }
 
@@ -309,6 +307,14 @@ func (h *Handler) up(ctx context.Context) error {
 		return errors.New("closed")
 	}
 	h.bind.SetCtx(ctx)
+	// IpcSet resolves the endpoints, so it waits for the first request:
+	// DNS may not be ready while the outbounds are being created.
+	if h.ipc != "" {
+		if err := h.dev.IpcSet(h.ipc); err != nil {
+			return err
+		}
+		h.ipc = ""
+	}
 	return h.dev.Up()
 }
 
