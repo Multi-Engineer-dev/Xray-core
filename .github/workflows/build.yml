@@ -3,6 +3,8 @@ name: Build
 on:
   push:
     branches: [dev]
+    paths-ignore:
+      - ".github/**"
   workflow_dispatch:
 
 permissions:
