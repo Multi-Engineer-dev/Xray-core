@@ -8,6 +8,7 @@ import (
 	"net/netip"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"syscall"
 
 	"github.com/xtls/xray-core/common"
@@ -45,11 +46,13 @@ type bind struct {
 	// batchEnabled opts a known native listener into Linux batching before
 	// NewDevice allocates its lifetime-sized pools. Custom/masked listeners
 	// default to one packet; Open may disable batching, but never enable it.
-	batchEnabled bool
+	// It is atomic so that BatchSize does not wait while Open holds mu to dial.
+	batchEnabled atomic.Bool
 
 	net.PacketConn
-	// batch is set when the conn is a plain UDP socket on Linux. The traffic
-	// counters are then applied here, since PacketCounterConnection is bypassed.
+	// udp is set when the conn is a plain UDP socket, and batch when Open also
+	// batches on it. Both bypass PacketCounterConnection, so the traffic
+	// counters are applied here.
 	batch        batchConn
 	gso          bool // batch takes UDP_SEGMENT
 	udp          *net.UDPConn
@@ -102,10 +105,10 @@ func (b *bind) Open(port uint16) (fns []conn.ReceiveFunc, actualPort uint16, err
 	}
 	b.PacketConn = c
 	b.udp, b.readCounter, b.writeCounter = nativeUDPConn(c)
-	if b.batchEnabled {
+	if b.batchEnabled.Load() {
 		b.batch, b.gso = newBatchConn(b.udp)
 		if b.batch == nil {
-			b.batchEnabled = false
+			b.batchEnabled.Store(false)
 		}
 	}
 	if b.batch != nil {
@@ -428,9 +431,7 @@ func (b *bind) ParseEndpoint(s string) (conn.Endpoint, error) {
 }
 
 func (b *bind) BatchSize() int {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	if b.batchEnabled {
+	if b.batchEnabled.Load() {
 		return batchSize
 	}
 	return 1

@@ -295,7 +295,10 @@ func TestUDPConsumedInputAndAuthentication(t *testing.T) {
 			if err != nil || !bytes.Equal(full.Payload, capacityPayload) {
 				t.Fatalf("capacity plaintext: %v", err)
 			}
-			if _, err := serverSession.EncodeServerPacket(method, client.ClientSessionID(), dest, append(capacityPayload, 1)); err != ErrPacketTooLarge {
+			if _, err := serverSession.EncodeServerPacket(method, client.ClientSessionID(), dest, append(capacityPayload, 1)); err != nil {
+				t.Fatalf("reply past one buffer: %v", err)
+			}
+			if _, err := serverSession.EncodeServerPacket(method, client.ClientSessionID(), dest, make([]byte, MaxPacketSize-overhead+1)); err != ErrPacketTooLarge {
 				t.Fatalf("oversize reply: %v", err)
 			}
 			clientOverhead := 16 + 11 + AddrPortLength(dest) + AEADTagSize

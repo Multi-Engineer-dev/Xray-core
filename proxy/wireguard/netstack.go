@@ -93,7 +93,17 @@ func (tun *netTun) Read(buf [][]byte, sizes []int, offset int) (int, error) {
 	case packet := <-tun.packets:
 		sizes[0] = copy(buf[0][offset:], packet.Bytes())
 		packet.Release()
-		return 1, nil
+		// Take the packets already queued too, so the bind can send them in one batch.
+		for n := 1; n < len(buf); n++ {
+			select {
+			case packet := <-tun.packets:
+				sizes[n] = copy(buf[n][offset:], packet.Bytes())
+				packet.Release()
+			default:
+				return n, nil
+			}
+		}
+		return len(buf), nil
 	case <-tun.closed:
 		return 0, os.ErrClosed
 	}
