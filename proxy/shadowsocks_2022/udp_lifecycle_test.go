@@ -542,3 +542,20 @@ func TestUDPStoreKeepsFirstSession(t *testing.T) {
 		t.Fatal("a packet decrypted with another key joined the session")
 	}
 }
+
+func TestUDPReplayRejectedAfterSessionEnds(t *testing.T) {
+	lifecycleCases(t, func(t *testing.T, method string, multi bool) {
+		h := newLifecycleHarness(t, method, multi)
+		first := h.packet(t)
+		h.send(first, newLifecycleConn())
+		h.manager.GetOrCreate(h.client.clientSessionID).end()
+		h.send(first, newLifecycleConn())
+		if got := h.dispatch.writer.count.Load(); got != 1 {
+			t.Fatal("a packet of an ended session was accepted again")
+		}
+		h.send(h.packet(t), newLifecycleConn())
+		if got := h.dispatch.writer.count.Load(); got != 2 {
+			t.Fatal("the client could not go on after its session ended")
+		}
+	})
+}

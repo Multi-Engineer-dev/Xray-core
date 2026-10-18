@@ -125,12 +125,21 @@ type UDPSessionManager struct {
 	sessions  *utils.TypedSyncMap[uint64, *ServerUDPSession]
 	timeout   time.Duration
 	lastClean atomic.Int64 // Unix timestamp in seconds
+	// ended keeps sessions deleted while their packets could still pass the
+	// timestamp check, so a new session for the same ID takes over their
+	// replay window instead of accepting those packets again.
+	ended *utils.TypedSyncMap[uint64, *ServerUDPSession]
 }
+
+// A packet passes the timestamp check up to 30 seconds either side of its
+// timestamp, so it can be replayed for up to a minute after it arrived.
+const replayableSeconds = 60
 
 func NewUDPSessionManager(timeout time.Duration) *UDPSessionManager {
 	return &UDPSessionManager{
 		sessions: utils.NewTypedSyncMap[uint64, *ServerUDPSession](),
 		timeout:  timeout,
+		ended:    utils.NewTypedSyncMap[uint64, *ServerUDPSession](),
 	}
 }
 
@@ -141,10 +150,7 @@ func (m *UDPSessionManager) GetOrCreate(sessionID uint64) *ServerUDPSession {
 		return s
 	}
 
-	s := &ServerUDPSession{
-		SessionID: sessionID,
-		manager:   m,
-	}
+	s := m.newSession(sessionID)
 	s.LastActive.Store(now)
 
 	actual, loaded := m.sessions.LoadOrStore(sessionID, s)
@@ -170,7 +176,20 @@ func (m *UDPSessionManager) Load(sessionID uint64) (*ServerUDPSession, bool) {
 		s.LastActive.Store(time.Now().Unix())
 		return s, true
 	}
-	return &ServerUDPSession{SessionID: sessionID, manager: m}, false
+	return m.newSession(sessionID), false
+}
+
+func (m *UDPSessionManager) newSession(sessionID uint64) *ServerUDPSession {
+	s := &ServerUDPSession{SessionID: sessionID, manager: m}
+	if old, ok := m.ended.Load(sessionID); ok {
+		old.replayMu.Lock()
+		if old.Window != nil {
+			window := *old.Window
+			s.Window = &window
+		}
+		old.replayMu.Unlock()
+	}
+	return s
 }
 
 // Store publishes a new session from Load after packetID authenticated on it.
@@ -210,9 +229,18 @@ func (m *UDPSessionManager) cleanup(now int64) {
 		}
 		return true
 	})
+	m.ended.Range(func(k uint64, v *ServerUDPSession) bool {
+		if now-v.LastActive.Load() > replayableSeconds {
+			m.ended.CompareAndDelete(k, v)
+		}
+		return true
+	})
 }
 
 func (m *UDPSessionManager) Delete(session *ServerUDPSession) {
 	// A late timeout must not delete a replacement with the same wire ID.
-	m.sessions.CompareAndDelete(session.SessionID, session)
+	if m.sessions.CompareAndDelete(session.SessionID, session) &&
+		time.Now().Unix()-session.LastActive.Load() <= replayableSeconds {
+		m.ended.Store(session.SessionID, session)
+	}
 }
