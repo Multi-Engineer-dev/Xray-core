@@ -463,3 +463,32 @@ func TestUDPCloseDuringDispatchDoesNotResurrectSession(t *testing.T) {
 		t.Fatal("closed session survived timer cleanup")
 	}
 }
+
+func TestUDPReplyCarriesFullBuffer(t *testing.T) {
+	lifecycleCases(t, func(t *testing.T, method string, multi bool) {
+		h := newLifecycleHarness(t, method, multi)
+		conn := newLifecycleConn()
+		h.send(h.packet(t), conn)
+		b := buf.New()
+		payload := b.Extend(buf.Size)
+		for i := range payload {
+			payload[i] = byte(i)
+		}
+		want := append([]byte(nil), payload...)
+		if err := h.dispatch.responses.WriteMultiBuffer(buf.MultiBuffer{b}); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case reply := <-conn.replies:
+			decoded, err := h.client.DecodePacket(reply)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(decoded.Payload, want) {
+				t.Fatalf("reply carried %d bytes, want the full %d", len(decoded.Payload), len(want))
+			}
+		case <-time.After(time.Second):
+			t.Fatal("full-size reply was dropped")
+		}
+	})
+}

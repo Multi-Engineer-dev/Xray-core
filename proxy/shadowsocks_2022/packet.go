@@ -352,7 +352,7 @@ func (s *ServerUDPSession) EncodeServerPacket(method *CipherMethod, clientSessio
 		}
 
 		plainLen := 35 + AddrPortLength(dest) + len(payload)
-		if PacketNonceSize+plainLen+AEADTagSize > buf.Size {
+		if PacketNonceSize+plainLen+AEADTagSize > MaxPacketSize {
 			return nil, ErrPacketTooLarge
 		}
 		res := make([]byte, PacketNonceSize+plainLen+AEADTagSize)
@@ -384,7 +384,7 @@ func (s *ServerUDPSession) EncodeServerPacket(method *CipherMethod, clientSessio
 	binary.BigEndian.PutUint64(rawHeader[8:16], serverPacketID)
 
 	plainLen := 19 + AddrPortLength(dest) + len(payload)
-	if 16+plainLen+AEADTagSize > buf.Size {
+	if 16+plainLen+AEADTagSize > MaxPacketSize {
 		return nil, ErrPacketTooLarge
 	}
 	res := make([]byte, 16+plainLen+AEADTagSize)
