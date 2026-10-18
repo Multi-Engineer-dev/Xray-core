@@ -1,0 +1,85 @@
+name: Node
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: PasarGuard node release to rebuild with this Xray, e.g. v0.5.4
+        required: true
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check the version
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          if [[ ! "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
+            echo "::error::$VERSION is not a node release such as v0.5.4"
+            exit 1
+          fi
+
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          check-latest: true
+
+      - name: Build Xray
+        env:
+          CGO_ENABLED: 0
+          GOOS: linux
+        run: |
+          mkdir dist
+          for arch in amd64 arm64; do
+            GOARCH=$arch go build -o dist/xray-$arch -trimpath -buildvcs=false -gcflags="all=-l=4" -ldflags="-X github.com/xtls/xray-core/core.build=$(git rev-parse --short HEAD) -s -w -buildid=" -v ./main
+          done
+
+      - name: Name the image
+        id: image
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          IMAGE="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/pasarguard-node"
+          PINNED="$IMAGE:$VERSION-xray-$(git rev-parse --short HEAD)"
+          echo "pinned=$PINNED" >> "$GITHUB_OUTPUT"
+          echo "tags=$IMAGE:$VERSION,$PINNED" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v4
+
+      - uses: docker/login-action@v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # The official image of that release, with its xray replaced by ours.
+      - uses: docker/build-push-action@v7
+        with:
+          context: dist
+          file: .github/docker/node.Dockerfile
+          platforms: linux/amd64,linux/arm64
+          build-args: NODE_VERSION=${{ inputs.version }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          push: true
+          tags: ${{ steps.image.outputs.tags }}
+
+      - name: Check the image's Xray
+        env:
+          PINNED: ${{ steps.image.outputs.pinned }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          {
+            echo "PasarGuard node $VERSION with this Xray: \`$PINNED\`"
+            echo '```'
+            docker run --rm --entrypoint /usr/local/bin/xray "$PINNED" version
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
