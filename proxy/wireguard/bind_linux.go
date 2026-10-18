@@ -7,6 +7,7 @@ import (
 	goerrors "errors"
 	"net"
 	"os"
+	"runtime"
 	"syscall"
 	"unsafe"
 
@@ -83,7 +84,9 @@ func (m *bindSendmsg) send(fd uintptr) bool {
 }
 
 func writeBatch(bc batchConn, raw syscall.RawConn, send *bindSendmsg, msgs []ipv6.Message) (int, error) {
-	if len(msgs) != 1 || len(msgs[0].OOB) == 0 || raw == nil {
+	// 386 sends through socketcall in x/net and x/sys, and a seccomp filter
+	// built for that (Android x86) may not allow a direct sendmsg.
+	if runtime.GOARCH == "386" || len(msgs) != 1 || len(msgs[0].OOB) == 0 || raw == nil {
 		return bc.WriteBatch(msgs, 0)
 	}
 	message := &msgs[0]

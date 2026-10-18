@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"runtime"
 	"sync"
 	"syscall"
 	"testing"
@@ -91,7 +92,17 @@ func (r *gsoTestRaw) Write(f func(uintptr) bool) error {
 	return r.RawConn.Write(f)
 }
 
+// skipWithoutRawSendmsg skips tests that inject errors into the raw sendmsg
+// of a single GSO message, which 386 does not use.
+func skipWithoutRawSendmsg(t *testing.T) {
+	t.Helper()
+	if runtime.GOARCH == "386" {
+		t.Skip("GSO messages are sent through WriteBatch on 386")
+	}
+}
+
 func TestBindGSOSingleMessageErrors(t *testing.T) {
+	skipWithoutRawSendmsg(t)
 	for _, test := range []struct {
 		name string
 		err  error
@@ -444,6 +455,7 @@ func TestBindGSOSendReceiveReuse(t *testing.T) {
 }
 
 func TestBindGSOConcurrentDisable(t *testing.T) {
+	skipWithoutRawSendmsg(t)
 	sender, _, _ := newGSOTestBind(t, "udp4", "127.0.0.1:0")
 	receiver := newUDPClientTestSocket(t, "udp4", "127.0.0.1:0")
 	raw := &gsoTestRaw{RawConn: sender.raw, steps: []error{unix.EIO}}
