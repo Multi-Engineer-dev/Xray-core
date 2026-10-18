@@ -140,16 +140,38 @@ func BenchmarkBindUDP(b *testing.B) {
 				b.Fatal(err)
 			}
 			writes, _, _ := benchmarkBuffers(batch, throughputPacketSize)
+			// Number each datagram at both ends, past the reserved bytes that
+			// receive clears, so that a bind losing, cutting or mixing up
+			// datagrams fails instead of giving a number.
+			for i, w := range writes {
+				binary.BigEndian.PutUint32(w[4:], uint32(i))
+				binary.BigEndian.PutUint32(w[len(w)-4:], uint32(i))
+			}
 			reads, sizes, eps := benchmarkBuffers(receiver.BatchSize(), throughputPacketSize)
 			done := make(chan error, 1)
 			go func() {
+				seen := make([]bool, batch)
 				for range b.N {
+					clear(seen)
 					remaining := batch
 					for remaining > 0 {
 						n, err := receive(reads, sizes, eps)
 						if err != nil {
 							done <- err
 							return
+						}
+						for i := range n {
+							p := reads[i][:sizes[i]]
+							if len(p) != throughputPacketSize {
+								done <- fmt.Errorf("received %d bytes, want %d", len(p), throughputPacketSize)
+								return
+							}
+							id := binary.BigEndian.Uint32(p[4:])
+							if id >= uint32(batch) || seen[id] || binary.BigEndian.Uint32(p[len(p)-4:]) != id {
+								done <- fmt.Errorf("datagram %d was changed or received twice", id)
+								return
+							}
+							seen[id] = true
 						}
 						remaining -= n
 					}

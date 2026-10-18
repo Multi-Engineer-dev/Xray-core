@@ -416,8 +416,36 @@ func TestBindGSOLimits(t *testing.T) {
 	}
 }
 
+// pinTestMsgs makes every pooled send of b use the returned messages, so that
+// a test can check what Send leaves in them. The sends must not overlap.
+func pinTestMsgs(b *bind) *bindMessages {
+	msgs := new(bind).getMsgs()
+	b.msgsPool.New = func() any { return msgs }
+	return msgs
+}
+
+// checkReleasedMsgs fails unless the last send went to ep through msgs, and
+// putMsgs left no datagram or address of it in any message, nor an iovec of
+// its GSO sendmsg. A pooled message must not keep wireguard-go's buffers.
+func checkReleasedMsgs(t *testing.T, msgs *bindMessages, ep *conn.StdNetEndpoint) {
+	t.Helper()
+	if msgs.addr.Port != int(ep.AddrPort.Port()) {
+		t.Fatal("the send did not use the pinned messages")
+	}
+	msgs.addr = net.UDPAddr{} // for the next check to see the next send
+	for i := range msgs.messages {
+		if msgs.messages[i].Buffers != nil || msgs.messages[i].Addr != nil {
+			t.Fatalf("pooled message %d still holds a datagram or its address", i)
+		}
+	}
+	if msgs.used != 0 || msgs.send.hdr != (unix.Msghdr{}) || msgs.send.iov != ([maxGSOSegments]unix.Iovec{}) {
+		t.Fatal("pooled messages still hold the last sendmsg")
+	}
+}
+
 func TestBindGSOSendReceiveReuse(t *testing.T) {
 	sender, receive, socket := newGSOTestBind(t, "udp4", "127.0.0.1:0")
+	msgs := pinTestMsgs(sender)
 	receiver := newUDPClientTestSocket(t, "udp4", "127.0.0.1:0")
 	ep := &conn.StdNetEndpoint{AddrPort: receiver.LocalAddr().(*net.UDPAddr).AddrPort()}
 	for i := range 32 {
@@ -425,6 +453,7 @@ func TestBindGSOSendReceiveReuse(t *testing.T) {
 		if err := sender.Send(writes, ep); err != nil {
 			t.Fatal(err)
 		}
+		checkReleasedMsgs(t, msgs, ep)
 		readGSOPackets(t, receiver, writes)
 		reply := bytes.Repeat([]byte{byte(i + 3)}, 96)
 		if _, err := receiver.WriteToUDP(reply, socket.LocalAddr().(*net.UDPAddr)); err != nil {
@@ -440,16 +469,19 @@ func TestBindGSOSendReceiveReuse(t *testing.T) {
 		clear(wantReply[1:4])
 		if n, err := receive(reads, sizes, eps); n != 1 || err != nil || !bytes.Equal(reads[0][:sizes[0]], wantReply) ||
 			eps[0].(*conn.StdNetEndpoint).AddrPort != ep.AddrPort {
-			t.Fatalf("receive after GSO pool reuse: n=%d size=%d err=%v data=%x want=%x", n, sizes[0], err, reads[0][:sizes[0]], wantReply)
+			t.Fatalf("receive after a GSO send: n=%d size=%d err=%v data=%x want=%x", n, sizes[0], err, reads[0][:sizes[0]], wantReply)
 		}
-		// A plain packet larger than the old segment size must not inherit
-		// UDP_SEGMENT from the same pool and turn into several datagrams.
-		if err := sender.Send([][]byte{reply}, ep); err != nil {
+		// Plain datagrams larger than the old segment size, in the same pooled
+		// messages, must not inherit UDP_SEGMENT and turn into several datagrams.
+		// A single datagram would not use the pool.
+		plain := [][]byte{reply, bytes.Repeat([]byte{byte(i + 4)}, 112)}
+		if err := sender.Send(plain, ep); err != nil {
 			t.Fatal(err)
 		}
-		readGSOPackets(t, receiver, [][]byte{reply})
+		checkReleasedMsgs(t, msgs, ep)
+		readGSOPackets(t, receiver, plain)
 	}
-	if sender.readCounter.Value() != 32*96 || sender.writeCounter.Value() != 32*(16+16+96) {
+	if sender.readCounter.Value() != 32*96 || sender.writeCounter.Value() != 32*(16+16+96+112) {
 		t.Fatalf("reuse counters: read=%d write=%d", sender.readCounter.Value(), sender.writeCounter.Value())
 	}
 }
@@ -506,19 +538,24 @@ func TestBindGSOConcurrentDisable(t *testing.T) {
 
 func TestBindGSOHighWaterReceiveReuse(t *testing.T) {
 	sender, receive, socket := newGSOTestBind(t, "udp4", "127.0.0.1:0")
+	msgs := pinTestMsgs(sender)
 	receiver := newUDPClientTestSocket(t, "udp4", "127.0.0.1:0")
+	if err := receiver.SetReadBuffer(socketBufferSize); err != nil {
+		t.Fatal(err)
+	}
 	ep := &conn.StdNetEndpoint{AddrPort: receiver.LocalAddr().(*net.UDPAddr).AddrPort()}
 	var sentBytes int64
 	for range 4 {
-		// An increasing-size batch uses many message slots, followed by a
-		// compact GSO batch. Reusing the pool must release the earlier slots
-		// too, not just those touched by the final send chunk.
-		writes := make([][]byte, 66)
+		// Datagrams of increasing size take a message each, more than one
+		// send chunk has, and the final chunk ends in a compact GSO batch.
+		// putMsgs must release the messages of the first chunk too, not just
+		// those the final chunk used.
+		writes := make([][]byte, len(msgs.messages)+4)
 		expected := make([][]byte, len(writes))
 		for i := range writes {
 			size := 32 + i
-			if i >= 64 {
-				size = 128
+			if i >= len(writes)-2 {
+				size = 192
 			}
 			writes[i] = bytes.Repeat([]byte{byte(i + 1)}, size)
 			expected[i] = bytes.Clone(writes[i])
@@ -527,6 +564,7 @@ func TestBindGSOHighWaterReceiveReuse(t *testing.T) {
 		if err := sender.Send(writes, ep); err != nil {
 			t.Fatal(err)
 		}
+		checkReleasedMsgs(t, msgs, ep)
 		readGSOPackets(t, receiver, expected)
 		for i := range 64 {
 			if _, err := receiver.WriteToUDP(bytes.Repeat([]byte{byte(i)}, 128), socket.LocalAddr().(*net.UDPAddr)); err != nil {
@@ -548,15 +586,10 @@ func TestBindGSOHighWaterReceiveReuse(t *testing.T) {
 				clear(want[1:4]) // Match the receive reserved-byte contract.
 				if sizes[i] != len(want) || !bytes.Equal(reads[i][:sizes[i]], want) ||
 					eps[i].(*conn.StdNetEndpoint).AddrPort != ep.AddrPort {
-					t.Fatalf("pooled receive packet %d: length=%d data=%x want=%x", count+i, sizes[i], reads[i][:sizes[i]], want)
+					t.Fatalf("batched receive packet %d: length=%d data=%x want=%x", count+i, sizes[i], reads[i][:sizes[i]], want)
 				}
 			}
 			count += n
-		}
-		for i := range writes {
-			if !bytes.Equal(writes[i], expected[i]) {
-				t.Fatalf("released send input %d overwritten by receive", i)
-			}
 		}
 	}
 	if sender.readCounter.Value() != 4*64*128 || sender.writeCounter.Value() != sentBytes {

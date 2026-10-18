@@ -19,11 +19,9 @@ import (
 	xrayws "github.com/xtls/xray-core/transport/internet/websocket"
 )
 
-// Exercise the public writers over real TLS records and WebSocket messages.
-// These contracts also apply without PR #4. To cover #4's optimized writer
-// paths, compose that independent implementation separately and run:
-// go test ./testing/scenarios -run '^TestTransportWriter' -count=1
-// No PR #4 production implementation is included with these regression tests.
+// Exercise the public writers over real TLS records and WebSocket messages:
+// WriteMultiBuffer delivers every byte in order, and it releases the buffers
+// it is given, also when the write fails.
 func transportWriterPair(t *testing.T, transport string) (buf.Writer, func([]string) error, func()) {
 	t.Helper()
 	if transport == "TLS" {

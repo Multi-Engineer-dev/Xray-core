@@ -16,8 +16,9 @@ import (
 	"github.com/xtls/xray-core/transport/internet"
 )
 
-// Keep the nil-parent default and worker teardown contract covered independently
-// of the transport writer optimizations in PR #4.
+// With no Context set, the factory runs the proxy on a background context that
+// carries the mux destination. Closing the worker ends that processing, and the
+// context is canceled after it.
 func TestDialingWorkerFactoryNilContext(t *testing.T) {
 	mockCtl := gomock.NewController(t)
 	defer mockCtl.Finish()
