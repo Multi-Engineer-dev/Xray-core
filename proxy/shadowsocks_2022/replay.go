@@ -1,6 +1,7 @@
 package shadowsocks_2022
 
 import (
+	"bytes"
 	"crypto/cipher"
 	"sync"
 	"sync/atomic"
@@ -159,6 +160,41 @@ func (m *UDPSessionManager) GetOrCreate(sessionID uint64) *ServerUDPSession {
 	}
 
 	return s
+}
+
+// Load returns the session stored for sessionID, or a new one that Store
+// publishes once a packet for it authenticates, so packets that fail
+// authentication cannot fill the map.
+func (m *UDPSessionManager) Load(sessionID uint64) (*ServerUDPSession, bool) {
+	if s, ok := m.sessions.Load(sessionID); ok {
+		s.LastActive.Store(time.Now().Unix())
+		return s, true
+	}
+	return &ServerUDPSession{SessionID: sessionID, manager: m}, false
+}
+
+// Store publishes a new session from Load after packetID authenticated on it.
+// If another packet stored a session for the same ID first, that session is
+// returned, and the packet counts only if it is new to it and was decrypted
+// with the same key.
+func (m *UDPSessionManager) Store(s *ServerUDPSession, packetID uint64) (*ServerUDPSession, bool) {
+	now := time.Now().Unix()
+	s.LastActive.Store(now)
+	actual, loaded := m.sessions.LoadOrStore(s.SessionID, s)
+	if !loaded {
+		last := m.lastClean.Load()
+		if now-last > 30 && m.lastClean.CompareAndSwap(last, now) {
+			go m.cleanup(now)
+		}
+		return s, true
+	}
+	actual.LastActive.Store(now)
+	actual.receiveMu.Lock()
+	defer actual.receiveMu.Unlock()
+	actual.userMu.RLock()
+	sameKey := bytes.Equal(actual.UserPSK, s.UserPSK)
+	actual.userMu.RUnlock()
+	return actual, sameKey && actual.AcceptPacketID(packetID)
 }
 
 func (m *UDPSessionManager) cleanup(now int64) {

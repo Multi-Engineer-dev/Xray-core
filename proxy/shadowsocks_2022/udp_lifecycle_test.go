@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/cipher"
+	"crypto/rand"
 	"encoding/binary"
 	"io"
 	"sync"
@@ -491,4 +492,53 @@ func TestUDPReplyCarriesFullBuffer(t *testing.T) {
 			t.Fatal("full-size reply was dropped")
 		}
 	})
+}
+
+func TestUDPUnauthenticatedPacketsStoreNoSession(t *testing.T) {
+	lifecycleCases(t, func(t *testing.T, method string, multi bool) {
+		h := newLifecycleHarness(t, method, multi)
+		for range 64 {
+			junk := make([]byte, 64)
+			rand.Read(junk)
+			h.send(junk, newLifecycleConn())
+		}
+		forged := h.packet(t)
+		forged[len(forged)-1] ^= 1
+		h.send(forged, newLifecycleConn())
+		count := func() (n int) {
+			h.manager.sessions.Range(func(uint64, *ServerUDPSession) bool { n++; return true })
+			return n
+		}
+		if n := count(); n != 0 {
+			t.Fatalf("packets that failed authentication stored %d sessions", n)
+		}
+		h.send(h.packet(t), newLifecycleConn())
+		if n := count(); n != 1 {
+			t.Fatalf("an authenticated packet stored %d sessions, want 1", n)
+		}
+	})
+}
+
+func TestUDPStoreKeepsFirstSession(t *testing.T) {
+	m := NewUDPSessionManager(time.Hour)
+	// Each session stands for a first packet that called Load before any Store.
+	newSession := func(key byte) *ServerUDPSession {
+		return &ServerUDPSession{SessionID: 7, manager: m, UserPSK: []byte{key}}
+	}
+	if _, ok := m.Load(7); ok {
+		t.Fatal("Load stored a session")
+	}
+	first := newSession(1)
+	if got, ok := m.Store(first, 1); got != first || !ok {
+		t.Fatal("first session was not stored")
+	}
+	if got, ok := m.Store(newSession(1), 2); got != first || !ok {
+		t.Fatal("a new packet of the stored session was refused")
+	}
+	if _, ok := m.Store(newSession(1), 2); ok {
+		t.Fatal("a replayed packet was accepted")
+	}
+	if _, ok := m.Store(newSession(2), 3); ok {
+		t.Fatal("a packet decrypted with another key joined the session")
+	}
 }

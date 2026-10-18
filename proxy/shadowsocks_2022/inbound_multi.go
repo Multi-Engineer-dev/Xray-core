@@ -335,7 +335,7 @@ func (i *MultiUserInbound) decodeUDPPacket(packetBytes []byte) (DecodedUDPPacket
 	i.udpMasterCipher.Decrypt(rawHeader[:], packetBytes[:16])
 	sessionID := binary.BigEndian.Uint64(rawHeader[:8])
 	packetID := binary.BigEndian.Uint64(rawHeader[8:])
-	s := i.udpSessions.GetOrCreate(sessionID)
+	s, stored := i.udpSessions.Load(sessionID)
 	s.receiveMu.Lock()
 	defer s.receiveMu.Unlock()
 	s.userMu.RLock()
@@ -359,5 +359,12 @@ func (i *MultiUserInbound) decodeUDPPacket(packetBytes []byte) (DecodedUDPPacket
 		s.User, s.UserPSK = user, userPSK
 	}
 	s.userMu.Unlock()
+	if !stored {
+		// No one else can reach s yet, so holding its lock while Store locks
+		// the session stored first cannot deadlock.
+		if decoded.session, stored = i.udpSessions.Store(s, packetID); !stored {
+			return DecodedUDPPacket{}, nil, ErrPacketIdNotUnique
+		}
+	}
 	return decoded, userPSK, nil
 }

@@ -242,12 +242,19 @@ func (c *UDPCodec) DecodePacket(data []byte) (DecodedUDPPacket, error) {
 	sessionID := binary.BigEndian.Uint64(rawHeader[:8])
 	packetID := binary.BigEndian.Uint64(rawHeader[8:16])
 
-	sessionItem := c.sessions.GetOrCreate(sessionID)
-	if !sessionItem.CheckPacketID(packetID) {
+	sessionItem, ok := c.sessions.Load(sessionID)
+	if ok && !sessionItem.CheckPacketID(packetID) {
 		return DecodedUDPPacket{}, ErrPacketIdNotUnique
 	}
 
-	return sessionItem.DecryptAESPayload(c.method, c.psk, sessionID, packetID, rawHeader[:], data[16:])
+	decoded, err := sessionItem.DecryptAESPayload(c.method, c.psk, sessionID, packetID, rawHeader[:], data[16:])
+	if err != nil || ok {
+		return decoded, err
+	}
+	if decoded.session, ok = c.sessions.Store(sessionItem, packetID); !ok {
+		return DecodedUDPPacket{}, ErrPacketIdNotUnique
+	}
+	return decoded, nil
 }
 
 // DecryptAESPayload consumes bodyCipher in place. The returned Payload aliases
