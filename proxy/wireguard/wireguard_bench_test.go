@@ -115,7 +115,8 @@ func newThroughputBind(tb testing.TB, network, address string) (*bind, conn.Rece
 	if err != nil {
 		tb.Fatal(err)
 	}
-	b := &bind{ctx: context.Background(), batchEnabled: true, listenFunc: func(context.Context) (net.PacketConn, error) { return udp, nil }}
+	b := &bind{ctx: context.Background(), listenFunc: func(context.Context) (net.PacketConn, error) { return udp, nil }}
+	b.batchEnabled.Store(true)
 	fns, _, err := b.Open(0)
 	if err != nil {
 		udp.Close()
@@ -178,9 +179,10 @@ func newBenchmarkWireGuardDevices(tb testing.TB, tuns [2]tun.Device) {
 	var ports [2]int
 	var private, public [2][32]byte
 	for i, tdev := range tuns {
-		binding := &bind{ctx: context.Background(), batchEnabled: true, listenFunc: func(context.Context) (net.PacketConn, error) {
+		binding := &bind{ctx: context.Background(), listenFunc: func(context.Context) (net.PacketConn, error) {
 			return net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 		}}
+		binding.batchEnabled.Store(true)
 		devs[i] = device.NewDevice(tdev, binding, device.NewLogger(device.LogLevelError, ""))
 		tb.Cleanup(devs[i].Close)
 		private[i][0] = byte(8 * (i + 1))
