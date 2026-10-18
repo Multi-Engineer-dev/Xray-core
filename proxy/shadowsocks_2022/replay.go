@@ -6,7 +6,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/protocol"
 	"github.com/xtls/xray-core/common/signal"
 	"github.com/xtls/xray-core/common/utils"
@@ -180,12 +179,4 @@ func (m *UDPSessionManager) cleanup(now int64) {
 func (m *UDPSessionManager) Delete(session *ServerUDPSession) {
 	// A late timeout must not delete a replacement with the same wire ID.
 	m.sessions.CompareAndDelete(session.SessionID, session)
-}
-
-func (m *UDPSessionManager) EncodeServerPacket(method *CipherMethod, psk []byte, clientSessionID uint64, dest net.Destination, payload []byte) ([]byte, error) {
-	sessionItem := m.GetOrCreate(clientSessionID)
-	if err := sessionItem.EnsureServerState(method, psk); err != nil {
-		return nil, err
-	}
-	return sessionItem.EncodeServerPacket(method, clientSessionID, dest, payload)
 }

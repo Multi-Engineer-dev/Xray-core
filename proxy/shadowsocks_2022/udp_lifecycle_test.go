@@ -14,6 +14,7 @@ import (
 	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/protocol"
+	"github.com/xtls/xray-core/common/session"
 	"github.com/xtls/xray-core/common/utils"
 	"github.com/xtls/xray-core/features/policy"
 	"github.com/xtls/xray-core/features/routing"
@@ -70,12 +71,14 @@ type lifecycleDispatcher struct {
 	count     atomic.Int32
 	writer    lifecycleWriter
 	responses *pipe.Writer
+	ctx       context.Context
 }
 
-func (d *lifecycleDispatcher) Dispatch(context.Context, net.Destination) (*transport.Link, error) {
+func (d *lifecycleDispatcher) Dispatch(ctx context.Context, _ net.Destination) (*transport.Link, error) {
 	d.count.Add(1)
 	reader, writer := pipe.New()
 	d.responses = writer
+	d.ctx = ctx
 	return &transport.Link{Reader: reader, Writer: &d.writer}, nil
 }
 
@@ -143,8 +146,12 @@ func (h *lifecycleHarness) packet(t *testing.T) []byte {
 }
 
 func (h *lifecycleHarness) send(packet []byte, c *lifecycleConn) {
+	h.sendContext(context.Background(), packet, c)
+}
+
+func (h *lifecycleHarness) sendContext(ctx context.Context, packet []byte, c *lifecycleConn) {
 	c.packet = append([]byte(nil), packet...)
-	_ = h.process(context.Background(), c, h.dispatch)
+	_ = h.process(ctx, c, h.dispatch)
 }
 func newLifecycleConn() *lifecycleConn { return &lifecycleConn{replies: make(chan []byte, 16)} }
 func lifecycleCases(t *testing.T, fn func(*testing.T, string, bool)) {
@@ -188,6 +195,56 @@ func TestUDPAuthenticatedRebinding(t *testing.T) {
 		default:
 		}
 	})
+}
+
+func TestUDPSessionEndsWithReturnPath(t *testing.T) {
+	lifecycleCases(t, func(t *testing.T, method string, multi bool) {
+		h := newLifecycleHarness(t, method, multi)
+		oldCtx, closeOld := context.WithCancel(context.Background())
+		newCtx, closeNew := context.WithCancel(context.Background())
+		defer closeNew()
+		h.sendContext(oldCtx, h.packet(t), newLifecycleConn())
+		h.sendContext(newCtx, h.packet(t), newLifecycleConn())
+		sessCtx := h.dispatch.ctx
+		closeOld()
+		if sessCtx.Err() != nil {
+			t.Fatal("first connection ended a session that moved away from it")
+		}
+		closeNew()
+		select {
+		case <-sessCtx.Done():
+		case <-time.After(time.Second):
+			t.Fatal("session outlived the connection carrying its replies")
+		}
+		if h.manager.GetOrCreate(h.client.clientSessionID).link.Load() != nil {
+			t.Fatal("ended session is still stored")
+		}
+	})
+}
+
+func TestUDPSessionsKeepOwnInboundUser(t *testing.T) {
+	inbound := &session.Inbound{Tag: "in"}
+	ctx := session.ContextWithInbound(context.Background(), inbound)
+	m := NewUDPSessionManager(time.Hour)
+	var dispatchers []*lifecycleDispatcher
+	for n, email := range []string{"a@example.invalid", "b@example.invalid"} {
+		s := m.GetOrCreate(uint64(n + 1))
+		defer s.Close()
+		s.User = &protocol.MemoryUser{Email: email}
+		d := new(lifecycleDispatcher)
+		if _, err := s.EnsureLink(ctx, newLifecycleConn(), net.UDPDestination(net.LocalHostIP, 53), d, lifecyclePolicy{idle: time.Hour}, nil); err != nil {
+			t.Fatal(err)
+		}
+		dispatchers = append(dispatchers, d)
+	}
+	a := session.InboundFromContext(dispatchers[0].ctx).User
+	b := session.InboundFromContext(dispatchers[1].ctx).User
+	if a.Email != "a@example.invalid" || b.Email != "b@example.invalid" {
+		t.Fatalf("sessions on one source address got users %s and %s", a.Email, b.Email)
+	}
+	if inbound.User != nil {
+		t.Fatal("session user leaked into the shared inbound")
+	}
 }
 
 func TestUDPConcurrentReplayAndInitialization(t *testing.T) {
@@ -304,7 +361,7 @@ func TestUDPReturnPathUpdateDoesNotAllocate(t *testing.T) {
 	s := new(ServerUDPSession)
 	conn := newLifecycleConn()
 	var id uint64
-	if allocs := testing.AllocsPerRun(1000, func() { id++; s.UpdateAuthenticatedConn(conn, id) }); allocs != 0 {
+	if allocs := testing.AllocsPerRun(1000, func() { id++; s.UpdateAuthenticatedConn(context.Background(), conn, id) }); allocs != 0 {
 		t.Fatalf("return-path update allocated %g objects", allocs)
 	}
 }

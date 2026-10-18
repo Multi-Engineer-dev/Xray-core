@@ -243,6 +243,10 @@ func (i *RelayInbound) processUDP(ctx context.Context, conn stat.Connection, dis
 			dest.Network = net.Network_UDP
 
 			sessionItem := i.udpSessions.GetOrCreate(sessionID)
+			if sessionItem.closed.Load() {
+				b.Release()
+				continue
+			}
 			sessionItem.userMu.Lock()
 			if sessionItem.User == nil {
 				sessionItem.User = &protocol.MemoryUser{
@@ -251,7 +255,7 @@ func (i *RelayInbound) processUDP(ctx context.Context, conn stat.Connection, dis
 				}
 			}
 			sessionItem.userMu.Unlock()
-			sessionItem.UpdateConn(conn)
+			sessionItem.UpdateConn(ctx, conn)
 			link := sessionItem.link.Load()
 			if link == nil {
 				var err error

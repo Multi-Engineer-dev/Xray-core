@@ -295,15 +295,17 @@ func (i *MultiUserInbound) processUDP(ctx context.Context, conn stat.Connection,
 				continue
 			}
 			sessionItem := decoded.session
-			sessionID := decoded.SessionID
-			sessionItem.UpdateAuthenticatedConn(conn, decoded.PacketID)
+			if sessionItem.closed.Load() {
+				continue
+			}
+			sessionItem.UpdateAuthenticatedConn(ctx, conn, decoded.PacketID)
 			link := sessionItem.link.Load()
 			if link == nil {
-				var err error
+				if err := sessionItem.EnsureServerState(i.method, userPSK); err != nil {
+					continue
+				}
+				sessionID := decoded.SessionID
 				link, err = sessionItem.EnsureLink(ctx, conn, decoded.Destination, dispatcher, i.policyManager, func(replyDest net.Destination, payload []byte) ([]byte, error) {
-					if err := sessionItem.EnsureServerState(i.method, userPSK); err != nil {
-						return nil, err
-					}
 					return sessionItem.EncodeServerPacket(i.method, sessionID, replyDest, payload)
 				})
 				if err != nil {

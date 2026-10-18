@@ -162,20 +162,23 @@ func (i *Inbound) processUDP(ctx context.Context, conn stat.Connection, dispatch
 			}
 
 			sessionItem := decoded.session
+			if sessionItem.closed.Load() {
+				continue
+			}
 			sessionItem.userMu.Lock()
 			if sessionItem.User == nil {
 				sessionItem.User = i.user
 			}
 			sessionItem.userMu.Unlock()
-			sessionItem.UpdateAuthenticatedConn(conn, decoded.PacketID)
+			sessionItem.UpdateAuthenticatedConn(ctx, conn, decoded.PacketID)
 			link := sessionItem.link.Load()
 			if link == nil {
-				var err error
+				if err := sessionItem.EnsureServerState(i.udpCodec.method, i.udpCodec.psk); err != nil {
+					continue
+				}
+				sessionID := decoded.SessionID
 				link, err = sessionItem.EnsureLink(ctx, conn, decoded.Destination, dispatcher, i.policyManager, func(dest net.Destination, payload []byte) ([]byte, error) {
-					if err := sessionItem.EnsureServerState(i.udpCodec.method, i.udpCodec.psk); err != nil {
-						return nil, err
-					}
-					return sessionItem.EncodeServerPacket(i.udpCodec.method, decoded.SessionID, dest, payload)
+					return sessionItem.EncodeServerPacket(i.udpCodec.method, sessionID, dest, payload)
 				})
 				if err != nil {
 					continue

@@ -470,9 +470,11 @@ func TestClientUDPSessionMultiDestination(t *testing.T) {
 			respPayload1 := []byte("reply-google-dns")
 			respPayload2 := []byte("reply-cloudflare-dns")
 
-			respPkt1, err := serverCodec.EncodeServerPacket(dec1.SessionID, dest1, respPayload1)
+			serverSession := serverCodec.Sessions().GetOrCreate(dec1.SessionID)
+			common.Must(serverSession.EnsureServerState(method, rawKey))
+			respPkt1, err := serverSession.EncodeServerPacket(method, dec1.SessionID, dest1, respPayload1)
 			common.Must(err)
-			respPkt2, err := serverCodec.EncodeServerPacket(dec2.SessionID, dest2, respPayload2)
+			respPkt2, err := serverSession.EncodeServerPacket(method, dec2.SessionID, dest2, respPayload2)
 			common.Must(err)
 
 			// Client decodes replies

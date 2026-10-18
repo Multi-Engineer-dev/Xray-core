@@ -25,24 +25,46 @@ type udpReturnPath struct {
 	sync.RWMutex
 	conn     stat.Connection
 	packetID uint64
+	stop     func() bool
 }
 
 // UpdateConn is used only by relays, which cannot authenticate the inner payload.
-func (s *ServerUDPSession) UpdateConn(conn stat.Connection) {
+func (s *ServerUDPSession) UpdateConn(ctx context.Context, conn stat.Connection) {
 	s.currentConn.Lock()
-	s.currentConn.conn = conn
+	s.setConn(ctx, conn)
 	s.currentConn.Unlock()
 	s.updateActivity()
 }
 
-func (s *ServerUDPSession) UpdateAuthenticatedConn(conn stat.Connection, packetID uint64) {
+func (s *ServerUDPSession) UpdateAuthenticatedConn(ctx context.Context, conn stat.Connection, packetID uint64) {
 	s.currentConn.Lock()
 	if s.currentConn.conn == nil || packetID > s.currentConn.packetID {
-		s.currentConn.conn = conn
+		s.setConn(ctx, conn)
 		s.currentConn.packetID = packetID
 	}
 	s.currentConn.Unlock()
 	s.updateActivity()
+}
+
+// setConn requires currentConn to be locked. The inbound worker cancels a
+// connection's context once it has been idle for a while, so the session ends
+// with the connection that carries its replies, not the one that created it.
+func (s *ServerUDPSession) setConn(ctx context.Context, conn stat.Connection) {
+	if s.currentConn.conn == conn {
+		return
+	}
+	if s.currentConn.stop != nil {
+		s.currentConn.stop()
+	}
+	s.currentConn.conn = conn
+	s.currentConn.stop = context.AfterFunc(ctx, func() {
+		s.currentConn.RLock()
+		current := s.currentConn.conn == conn
+		s.currentConn.RUnlock()
+		if current {
+			s.end()
+		}
+	})
 }
 
 func (s *ServerUDPSession) updateActivity() {
@@ -63,8 +85,20 @@ func (s *ServerUDPSession) WriteToClient(b []byte) error {
 	return err
 }
 
+func (s *ServerUDPSession) end() {
+	if s.manager != nil {
+		s.manager.Delete(s)
+	}
+	s.Close()
+}
+
 func (s *ServerUDPSession) Close() {
 	s.closed.Store(true)
+	s.currentConn.Lock()
+	if s.currentConn.stop != nil {
+		s.currentConn.stop()
+	}
+	s.currentConn.Unlock()
 	if timer := s.timer.Load(); timer != nil {
 		timer.SetTimeout(0)
 	}
@@ -92,13 +126,17 @@ func (s *ServerUDPSession) EnsureLink(
 		return link, nil
 	}
 
-	sessCtx, cancel := context.WithCancel(ctx)
+	// The client can move to another source address, so the context of the
+	// connection that created the session must not end it (see setConn).
+	sessCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
 	s.userMu.RLock()
 	user := s.User
 	s.userMu.RUnlock()
-	inbound := session.InboundFromContext(sessCtx)
-	if inbound != nil && user != nil {
-		inbound.User = user
+	if inbound := session.InboundFromContext(sessCtx); inbound != nil && user != nil {
+		// Sessions from one source address share its Inbound.
+		sessInbound := *inbound
+		sessInbound.User = user
+		sessCtx = session.ContextWithInbound(sessCtx, &sessInbound)
 	}
 	var email string
 	var level uint32
@@ -121,10 +159,7 @@ func (s *ServerUDPSession) EnsureLink(
 
 	sessionPolicy := policyManager.ForLevel(level)
 	timer := signal.CancelAfterInactivity(sessCtx, func() {
-		if s.manager != nil {
-			s.manager.Delete(s)
-		}
-		s.Close()
+		s.end()
 		cancel()
 	}, sessionPolicy.Timeouts.ConnectionIdle)
 	s.timer.Store(timer)

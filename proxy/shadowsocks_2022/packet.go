@@ -82,13 +82,6 @@ func (c *UDPCodec) Sessions() *UDPSessionManager {
 	return c.sessions
 }
 
-func (c *UDPCodec) GetSession(sessionID uint64) *ServerUDPSession {
-	if c.sessions == nil {
-		return nil
-	}
-	return c.sessions.GetOrCreate(sessionID)
-}
-
 type DecodedUDPPacket struct {
 	// Keep the authenticated generation instead of looking up its wire ID again.
 	session         *ServerUDPSession
@@ -404,10 +397,6 @@ func (s *ServerUDPSession) EncodeServerPacket(method *CipherMethod, clientSessio
 	copy(res[:16], encryptedHeader[:])
 	copy(res[16:], sealedBody)
 	return res, nil
-}
-
-func (c *UDPCodec) EncodeServerPacket(clientSessionID uint64, dest net.Destination, payload []byte) ([]byte, error) {
-	return c.sessions.EncodeServerPacket(c.method, c.psk, clientSessionID, dest, payload)
 }
 
 type serverSessionState struct {
