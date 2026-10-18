@@ -161,21 +161,24 @@ func (i *Inbound) processUDP(ctx context.Context, conn stat.Connection, dispatch
 				continue
 			}
 
-			sessionItem := i.udpCodec.GetSession(decoded.SessionID)
-			if sessionItem.User == nil {
-				sessionItem.Lock()
-				if sessionItem.User == nil {
-					sessionItem.User = i.user
-				}
-				sessionItem.Unlock()
+			sessionItem := decoded.session
+			if sessionItem.closed.Load() {
+				continue
 			}
+			sessionItem.userMu.Lock()
+			if sessionItem.User == nil {
+				sessionItem.User = i.user
+			}
+			sessionItem.userMu.Unlock()
+			sessionItem.UpdateAuthenticatedConn(ctx, conn, decoded.PacketID)
 			link := sessionItem.link.Load()
-			if link != nil {
-				sessionItem.UpdateConn(conn)
-			} else {
-				var err error
+			if link == nil {
+				if err := sessionItem.EnsureServerState(i.udpCodec.method, i.udpCodec.psk); err != nil {
+					continue
+				}
+				sessionID := decoded.SessionID
 				link, err = sessionItem.EnsureLink(ctx, conn, decoded.Destination, dispatcher, i.policyManager, func(dest net.Destination, payload []byte) ([]byte, error) {
-					return i.udpCodec.EncodeServerPacket(decoded.SessionID, dest, payload)
+					return sessionItem.EncodeServerPacket(i.udpCodec.method, sessionID, dest, payload)
 				})
 				if err != nil {
 					continue
