@@ -6,6 +6,8 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	stdnet "net"
+	"runtime"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -27,12 +29,18 @@ import (
 	"golang.zx2c4.com/wireguard/conn"
 )
 
-type testDNS struct{ ips []net.IP }
+type testDNS struct {
+	fail atomic.Bool
+	ips  []net.IP
+}
 
 func (*testDNS) Type() interface{} { return dns.ClientType() }
 func (*testDNS) Start() error      { return nil }
 func (*testDNS) Close() error      { return nil }
 func (d *testDNS) LookupIP(string, dns.IPOption) ([]net.IP, uint32, error) {
+	if d.fail.Load() {
+		return nil, 0, dns.ErrEmptyResponse
+	}
 	return d.ips, 600, nil
 }
 
@@ -80,6 +88,62 @@ func TestClientEndpointResolvedByXrayDNS(t *testing.T) {
 	t.Cleanup(func() { h.Close() })
 	if err := h.up(context.Background()); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// A setup that fails, here as the endpoint does not resolve yet, is retried by
+// the next connection on the same device. A new device for each attempt would
+// leave the workers of the failed ones reading the shared TUN.
+func TestClientRetriesFailedSetup(t *testing.T) {
+	v, err := core.New(&core.Config{App: []*serial.TypedMessage{serial.ToTypedMessage(&dnsapp.Config{})}})
+	common.Must(err)
+	t.Cleanup(func() { v.Close() })
+	ctx := context.WithValue(context.Background(), core.XrayKey(1), v)
+	ctx = session.ContextWithStreamSettings(ctx, &internet.MemoryStreamConfig{})
+	ctx = session.ContextWithFullHandler(ctx, untagged{})
+
+	priv, _ := testKey(t)
+	_, peerPub := testKey(t)
+	h, err := NewClient(ctx, &DeviceConfig{
+		IsClient:    true,
+		NoKernelTun: true,
+		SecretKey:   priv,
+		Endpoint:    []string{"10.0.0.2"},
+		Mtu:         1420,
+		Peers:       []*PeerConfig{{PublicKey: peerPub, Endpoint: "wg.test:51820", AllowedIps: []string{"0.0.0.0/0"}}},
+	})
+	common.Must(err)
+	t.Cleanup(func() { h.Close() })
+	d := &testDNS{ips: []net.IP{net.ParseIP("127.0.0.1")}}
+	d.fail.Store(true)
+	h.bind.resolveFunc = MakeResolveLocal(d, &internet.MemoryStreamConfig{})
+	dev, b := h.dev, h.bind
+
+	before := runtime.NumGoroutine()
+	for range 5 {
+		if err := h.up(context.Background()); err == nil {
+			t.Fatal("up succeeded although the endpoint does not resolve")
+		}
+		if h.dev != dev || h.bind != b || h.ipc == "" {
+			t.Fatal("failed up replaced the device or dropped the peer configuration")
+		}
+	}
+	// Goroutines of earlier tests may still be ending, none may be starting.
+	for deadline := time.Now().Add(time.Second); runtime.NumGoroutine() > before; time.Sleep(10 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatalf("goroutines grew from %d to %d over 5 failed ups", before, runtime.NumGoroutine())
+		}
+	}
+
+	d.fail.Store(false)
+	if err := h.up(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	b.mu.Lock()
+	opened := b.PacketConn != nil
+	b.mu.Unlock()
+	if h.dev != dev || h.ipc != "" || !opened {
+		t.Fatal("up did not finish the setup on the same device")
 	}
 }
 
