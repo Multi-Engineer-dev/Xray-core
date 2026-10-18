@@ -123,7 +123,7 @@ func NewClient(ctx context.Context, conf *DeviceConfig) (*Handler, error) {
 
 	blockup := newblockup(tun)
 	bind := &bind{
-		batchEnabled: streamSettings.FinalMask == nil && streamSettings.SocketSettings.GetDialerProxy() == "",
+		batchEnabled: !streamSettings.FinalMask.HasUDPMasks() && streamSettings.SocketSettings.GetDialerProxy() == "",
 	}
 	logger := &device.Logger{
 		Verbosef: func(format string, args ...any) {

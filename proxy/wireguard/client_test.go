@@ -20,6 +20,9 @@ import (
 	"github.com/xtls/xray-core/features/dns"
 	"github.com/xtls/xray-core/features/outbound"
 	"github.com/xtls/xray-core/transport/internet"
+	"github.com/xtls/xray-core/transport/internet/finalmask/fragment"
+	"github.com/xtls/xray-core/transport/internet/finalmask/salamander"
+	_ "github.com/xtls/xray-core/transport/internet/tcp"
 	"golang.org/x/crypto/curve25519"
 	"golang.zx2c4.com/wireguard/conn"
 )
@@ -266,5 +269,41 @@ func TestClientDialerProxyFallbackBatchBound(t *testing.T) {
 	if b.BatchSize() != 1 || b.batch != nil || wrapped.reads.Load() != 1 || wrapped.writes.Load() != 1 ||
 		rc.Value() != 5 || wc.Value() != 5 {
 		t.Fatalf("custom transport bypassed wrappers/counters or grew its batch: batch=%d read=%d write=%d", b.BatchSize(), rc.Value(), wc.Value())
+	}
+}
+
+// TCP masks leave the bind its plain UDP socket, and so its batches. Only UDP
+// masks change the datagrams.
+func TestClientBatchesWithTCPMasksOnly(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		config *internet.StreamConfig
+		batch  int
+	}{
+		{"tcpmasks", &internet.StreamConfig{Tcpmasks: []*serial.TypedMessage{serial.ToTypedMessage(&fragment.Config{})}}, batchSize},
+		{"udpmasks", &internet.StreamConfig{Udpmasks: []*serial.TypedMessage{serial.ToTypedMessage(&salamander.Config{Password: "wireguard-test"})}}, 1},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			settings, err := internet.ToMemoryStreamConfig(test.config)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if settings.FinalMask == nil {
+				t.Fatal("masks without a FinalMask")
+			}
+			h := newBindTestClient(t, settings)
+			if h.bind.BatchSize() != test.batch {
+				t.Fatalf("pre-open batch = %d, want %d", h.bind.BatchSize(), test.batch)
+			}
+			if err := h.up(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			h.bind.mu.Lock()
+			batched := h.bind.batch != nil
+			h.bind.mu.Unlock()
+			if batched != (test.batch > 1) || h.bind.BatchSize() != test.batch {
+				t.Fatalf("open bind batches=%v with a batch of %d, want %d", batched, h.bind.BatchSize(), test.batch)
+			}
+		})
 	}
 }

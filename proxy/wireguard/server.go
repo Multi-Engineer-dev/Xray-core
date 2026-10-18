@@ -278,7 +278,7 @@ func (s *Server) Start() error {
 	}
 	bind := &bind{
 		listenFunc:   listenFunc,
-		batchEnabled: s.streamSettings.FinalMask == nil,
+		batchEnabled: !s.streamSettings.FinalMask.HasUDPMasks(),
 	}
 	logger := &device.Logger{
 		Verbosef: func(format string, args ...any) {
