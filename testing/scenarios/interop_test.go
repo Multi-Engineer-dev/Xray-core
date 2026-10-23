@@ -173,6 +173,19 @@ func TestUpstreamClient(t *testing.T) {
 			with(s["servers"].([]obj)[0], "method", "2022-blake3-aes-128-gcm", "password", ssServerKey+":"+ssUserKey)
 			return obj{"protocol": "shadowsocks", "settings": s}
 		}},
+		{name: "Shadowsocks2022MultiUserXUDP", server: func(port net.Port) obj {
+			return obj{"protocol": "shadowsocks", "settings": obj{
+				"method": "2022-blake3-aes-128-gcm", "password": ssServerKey,
+				"clients": []obj{{"password": ssUserKey, "email": "user@example.com"}}, "network": "tcp,udp",
+			}}
+		}, client: func(port net.Port) obj {
+			s := server(port)
+			with(s["servers"].([]obj)[0], "method", "2022-blake3-aes-128-gcm", "password", ssServerKey+":"+ssUserKey)
+			return obj{
+				"protocol": "shadowsocks", "settings": s,
+				"mux": obj{"enabled": true, "concurrency": -1, "xudpConcurrency": 8, "xudpProxyUDP443": "allow"},
+			}
+		}},
 		{name: "Hysteria2", udp: true, server: func(port net.Port) obj {
 			return obj{
 				"protocol": "hysteria", "settings": obj{"version": 2, "clients": []obj{{"auth": id}}},
@@ -201,6 +214,9 @@ func TestUpstreamClient(t *testing.T) {
 
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
+			if c.name == "Hysteria2" && strings.HasPrefix(string(version), "Xray 25.12.8 ") {
+				t.Skip("official v25.12.8 does not implement the Hysteria transport")
+			}
 			serverPort := tcp.PickPort()
 			if c.udp {
 				serverPort = udp.PickPort()
