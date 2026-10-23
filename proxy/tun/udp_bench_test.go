@@ -82,7 +82,7 @@ func BenchmarkUDPWritePacket(b *testing.B) {
 			if err := s.writeUDP(payload, src, dst); err != nil {
 				b.Fatal(err)
 			}
-			packet, ok := parsePacket(dev.packet)
+			packet, ok := parsePacket(dev.packet, 0)
 			if !ok || packet.proto != protoUDP || !packet.verified() ||
 				packet.src.String() != tc.src || packet.dst.String() != tc.dst ||
 				!bytes.Equal(packet.payload[udpHeaderSize:], payload) {
