@@ -242,12 +242,19 @@ func (c *UDPCodec) DecodePacket(data []byte) (DecodedUDPPacket, error) {
 	sessionID := binary.BigEndian.Uint64(rawHeader[:8])
 	packetID := binary.BigEndian.Uint64(rawHeader[8:16])
 
-	sessionItem := c.sessions.GetOrCreate(sessionID)
-	if !sessionItem.CheckPacketID(packetID) {
+	sessionItem, ok := c.sessions.Load(sessionID)
+	if ok && !sessionItem.CheckPacketID(packetID) {
 		return DecodedUDPPacket{}, ErrPacketIdNotUnique
 	}
 
-	return sessionItem.DecryptAESPayload(c.method, c.psk, sessionID, packetID, rawHeader[:], data[16:])
+	decoded, err := sessionItem.DecryptAESPayload(c.method, c.psk, sessionID, packetID, rawHeader[:], data[16:])
+	if err != nil || ok {
+		return decoded, err
+	}
+	if decoded.session, ok = c.sessions.Store(sessionItem, packetID); !ok {
+		return DecodedUDPPacket{}, ErrPacketIdNotUnique
+	}
+	return decoded, nil
 }
 
 // DecryptAESPayload consumes bodyCipher in place. The returned Payload aliases
@@ -352,7 +359,7 @@ func (s *ServerUDPSession) EncodeServerPacket(method *CipherMethod, clientSessio
 		}
 
 		plainLen := 35 + AddrPortLength(dest) + len(payload)
-		if PacketNonceSize+plainLen+AEADTagSize > buf.Size {
+		if PacketNonceSize+plainLen+AEADTagSize > MaxPacketSize {
 			return nil, ErrPacketTooLarge
 		}
 		res := make([]byte, PacketNonceSize+plainLen+AEADTagSize)
@@ -384,7 +391,7 @@ func (s *ServerUDPSession) EncodeServerPacket(method *CipherMethod, clientSessio
 	binary.BigEndian.PutUint64(rawHeader[8:16], serverPacketID)
 
 	plainLen := 19 + AddrPortLength(dest) + len(payload)
-	if 16+plainLen+AEADTagSize > buf.Size {
+	if 16+plainLen+AEADTagSize > MaxPacketSize {
 		return nil, ErrPacketTooLarge
 	}
 	res := make([]byte, 16+plainLen+AEADTagSize)

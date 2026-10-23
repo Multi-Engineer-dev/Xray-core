@@ -115,7 +115,8 @@ func newThroughputBind(tb testing.TB, network, address string) (*bind, conn.Rece
 	if err != nil {
 		tb.Fatal(err)
 	}
-	b := &bind{ctx: context.Background(), batchEnabled: true, listenFunc: func(context.Context) (net.PacketConn, error) { return udp, nil }}
+	b := &bind{ctx: context.Background(), listenFunc: func(context.Context) (net.PacketConn, error) { return udp, nil }}
+	b.batchEnabled.Store(true)
 	fns, _, err := b.Open(0)
 	if err != nil {
 		udp.Close()
@@ -139,16 +140,38 @@ func BenchmarkBindUDP(b *testing.B) {
 				b.Fatal(err)
 			}
 			writes, _, _ := benchmarkBuffers(batch, throughputPacketSize)
+			// Number each datagram at both ends, past the reserved bytes that
+			// receive clears, so that a bind losing, cutting or mixing up
+			// datagrams fails instead of giving a number.
+			for i, w := range writes {
+				binary.BigEndian.PutUint32(w[4:], uint32(i))
+				binary.BigEndian.PutUint32(w[len(w)-4:], uint32(i))
+			}
 			reads, sizes, eps := benchmarkBuffers(receiver.BatchSize(), throughputPacketSize)
 			done := make(chan error, 1)
 			go func() {
+				seen := make([]bool, batch)
 				for range b.N {
+					clear(seen)
 					remaining := batch
 					for remaining > 0 {
 						n, err := receive(reads, sizes, eps)
 						if err != nil {
 							done <- err
 							return
+						}
+						for i := range n {
+							p := reads[i][:sizes[i]]
+							if len(p) != throughputPacketSize {
+								done <- fmt.Errorf("received %d bytes, want %d", len(p), throughputPacketSize)
+								return
+							}
+							id := binary.BigEndian.Uint32(p[4:])
+							if id >= uint32(batch) || seen[id] || binary.BigEndian.Uint32(p[len(p)-4:]) != id {
+								done <- fmt.Errorf("datagram %d was changed or received twice", id)
+								return
+							}
+							seen[id] = true
 						}
 						remaining -= n
 					}
@@ -178,9 +201,10 @@ func newBenchmarkWireGuardDevices(tb testing.TB, tuns [2]tun.Device) {
 	var ports [2]int
 	var private, public [2][32]byte
 	for i, tdev := range tuns {
-		binding := &bind{ctx: context.Background(), batchEnabled: true, listenFunc: func(context.Context) (net.PacketConn, error) {
+		binding := &bind{ctx: context.Background(), listenFunc: func(context.Context) (net.PacketConn, error) {
 			return net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 		}}
+		binding.batchEnabled.Store(true)
 		devs[i] = device.NewDevice(tdev, binding, device.NewLogger(device.LogLevelError, ""))
 		tb.Cleanup(devs[i].Close)
 		private[i][0] = byte(8 * (i + 1))

@@ -27,8 +27,7 @@ func openTestBind(t *testing.T, network, addr string, reserved []byte) (*bind, c
 	t.Helper()
 	rc, wc := &testCounter{}, &testCounter{}
 	b := &bind{
-		reserved:     reserved,
-		batchEnabled: true,
+		reserved: reserved,
 		listenFunc: func(context.Context) (net.PacketConn, error) {
 			c, err := net.ListenPacket(network, addr)
 			if err != nil {
@@ -37,6 +36,7 @@ func openTestBind(t *testing.T, network, addr string, reserved []byte) (*bind, c
 			return &PacketCounterConnection{PacketConn: c, ReadCounter: rc, WriteCounter: wc}, nil
 		},
 	}
+	b.batchEnabled.Store(true)
 	fns, _, err := b.Open(0)
 	if err != nil {
 		t.Fatal(err)
@@ -368,8 +368,7 @@ func TestBindFallbackDeliveryAndBatchBound(t *testing.T) {
 			var wrapped *wrappedTestPacketConn
 			opens := 0
 			b := &bind{
-				batchEnabled: optIn,
-				reserved:     []byte{1, 2, 3},
+				reserved: []byte{1, 2, 3},
 				listenFunc: func(context.Context) (net.PacketConn, error) {
 					c, err := net.ListenPacket("udp4", "127.0.0.1:0")
 					if err != nil {
@@ -383,6 +382,7 @@ func TestBindFallbackDeliveryAndBatchBound(t *testing.T) {
 					return &PacketCounterConnection{PacketConn: c, ReadCounter: rc, WriteCounter: wc}, nil
 				},
 			}
+			b.batchEnabled.Store(optIn)
 			t.Cleanup(func() { b.Close() })
 			beforeOpen := b.BatchSize()
 			wantBefore := 1
@@ -435,4 +435,37 @@ func TestBindFallbackDeliveryAndBatchBound(t *testing.T) {
 			}
 		})
 	}
+}
+
+// wireguard-go calls BatchSize when its pools run empty, so it must not wait
+// for an Open that is still dialing, e.g. resolving the endpoint.
+func TestBindBatchSizeDuringOpen(t *testing.T) {
+	dialing, release := make(chan struct{}), make(chan struct{})
+	b := &bind{listenFunc: func(context.Context) (net.PacketConn, error) {
+		close(dialing)
+		<-release
+		return net.ListenPacket("udp4", "127.0.0.1:0")
+	}}
+	b.batchEnabled.Store(true)
+	opened := make(chan error, 1)
+	go func() {
+		_, _, err := b.Open(0)
+		opened <- err
+	}()
+	<-dialing
+	size := make(chan int, 1)
+	go func() { size <- b.BatchSize() }()
+	select {
+	case n := <-size:
+		if n != batchSize {
+			t.Errorf("BatchSize during Open = %d, want %d", n, batchSize)
+		}
+	case <-time.After(5 * time.Second):
+		t.Error("BatchSize waited for Open")
+	}
+	close(release)
+	if err := <-opened; err != nil {
+		t.Fatal(err)
+	}
+	b.Close()
 }
