@@ -1,0 +1,4 @@
+ARG NODE_BASE
+FROM ${NODE_BASE}
+ARG TARGETARCH
+COPY xray-${TARGETARCH} /usr/local/bin/xray

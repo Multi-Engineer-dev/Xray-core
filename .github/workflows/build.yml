@@ -17,13 +17,21 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v7
 
       - uses: actions/setup-go@v7
         with:
-          go-version-file: go.mod
-          check-latest: true
+          go-version: '1.27.3'
+
+      - name: Validate before publishing a release
+        env:
+          GOTOOLCHAIN: go1.27.3
+          GOMAXPROCS: 4
+        run: |
+          bash .github/scripts/official-clients.sh "$RUNNER_TEMP/official"
+          bash .github/scripts/validate-release.sh "$RUNNER_TEMP/official"
 
       - name: Pick the version
         id: version
@@ -51,4 +59,4 @@ jobs:
           TAG: ${{ steps.version.outputs.tag }}
         run: |
           gh release create "$TAG" dist/* --target "$GITHUB_SHA" --latest --title "$TAG" \
-            --notes "main with wireguard-all, remove-user-close and remove-outbound-close merged, at ${GITHUB_SHA}."
+            --notes "Validated shared Xray at ${GITHUB_SHA}; official-client interop and race checks passed before publication."

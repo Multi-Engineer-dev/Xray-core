@@ -1,0 +1,46 @@
+name: Upstream clients
+
+on:
+  push:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  interop:
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.event.pull_request.base.repo.full_name
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # latest: the latest stable release, newest: the newest release, pre-releases included
+        release: [v25.12.8, v26.3.27, latest, newest]
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          check-latest: true
+
+      - name: Download the official release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "${{ matrix.release }}" = latest ]; then
+            TAG=$(gh release view --repo XTLS/Xray-core --json tagName --jq .tagName)
+          elif [ "${{ matrix.release }}" = newest ]; then
+            TAG=$(gh release list --repo XTLS/Xray-core --limit 1 --json tagName --jq '.[0].tagName')
+          else
+            TAG="${{ matrix.release }}"
+          fi
+          gh release download "$TAG" --repo XTLS/Xray-core --pattern Xray-linux-64.zip --dir "$RUNNER_TEMP/upstream"
+          unzip -q "$RUNNER_TEMP/upstream/Xray-linux-64.zip" xray -d "$RUNNER_TEMP/upstream"
+          echo "XRAY_UPSTREAM=$RUNNER_TEMP/upstream/xray" >> "$GITHUB_ENV"
+          echo "Official $TAG as the client" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Connect the official client to this build
+        run: go test -timeout 30m -v -run TestUpstreamClient ./testing/scenarios
