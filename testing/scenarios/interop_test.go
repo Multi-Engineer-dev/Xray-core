@@ -217,7 +217,7 @@ func TestUpstreamClient(t *testing.T) {
 			if c.name == "Hysteria2" && strings.HasPrefix(string(version), "Xray 25.12.8 ") {
 				t.Skip("official v25.12.8 does not implement the Hysteria transport")
 			}
-			serverPort := tcp.PickPort()
+			serverPort := pickTCPUDPPort(t)
 			if c.udp {
 				serverPort = udp.PickPort()
 			}
