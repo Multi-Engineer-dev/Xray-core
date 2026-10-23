@@ -233,8 +233,8 @@ func testRemoveUser(t *testing.T, c removeUserCase) {
 	if c.network == "udp" {
 		pick = udp.PickPort
 	}
-	serverPort := tcp.PickPort()
-	if c.network == "udp" || c.udpServer {
+	serverPort := pickTCPUDPPort(t)
+	if c.udpServer {
 		serverPort = udp.PickPort()
 	}
 	apiPort, portA, portB := tcp.PickPort(), pick(), pick()
